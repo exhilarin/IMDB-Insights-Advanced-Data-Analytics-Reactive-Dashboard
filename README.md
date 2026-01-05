@@ -49,6 +49,23 @@ Bu repo, IMDB’den film verisi toplayıp (Selenium + fallback), veriyi temizley
   mkdir -p logs
   ```
 
+  Alternatif: Tüm adımları tek komutla çalıştırmak için (önerilen)
+
+  Eğer repoda bulunan yardımcı script'leri kullanmak isterseniz, aşağıdaki iki komutla tüm pipeline ve frontend'i başlatıp durdurabilirsiniz.
+
+  ```bash
+  # scriptleri çalıştırılabilir yapın (ilk sefer)
+  chmod +x scripts/run_all.sh scripts/stop_all.sh
+
+  # hepsini başlat (venv oluşturma, deps yükleme, scraper ve frontend)
+  ./scripts/run_all.sh
+
+  # her şeyi durdurmak için
+  ./scripts/stop_all.sh
+  ```
+
+  Not: `run_all.sh` npm yüklü değilse frontend'i atlayacaktır. Loglar `logs/` içinde bulunur, PID dosyaları `logs/*.pid`.
+
   4. Scraper + pipeline'i çalıştırın — 250 film ve 250 dizi (toplam ~500 kayıt)
 
   Bu tek satır komutu arka planda çalıştırır, logları `logs/data_processor.log`'a yazar ve PID'i `logs/data_processor.pid` içine kaydeder.
