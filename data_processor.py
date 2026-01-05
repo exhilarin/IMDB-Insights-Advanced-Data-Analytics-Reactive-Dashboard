@@ -51,6 +51,14 @@ def parse_duration_to_minutes(s: Optional[str]) -> Optional[int]:
     if not s:
         return None
     text = str(s).strip().lower()
+    # ISO 8601 durations commonly appear in JSON-LD as 'PT2H22M' or 'PT45M'
+    m_iso = re.search(r'pt\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', text, re.I)
+    if m_iso:
+        h = int(m_iso.group(1)) if m_iso.group(1) else 0
+        mm = int(m_iso.group(2)) if m_iso.group(2) else 0
+        # seconds present in group(3) are ignored for minute precision
+        if h or mm:
+            return h * 60 + mm
     m = re.search(r"(\d+)\s*min", text)
     if m:
         return int(m.group(1))
@@ -327,12 +335,12 @@ def collect_top_list_with_fallback(url: str, limit: int, kind: str = "movie") ->
     return merged
 
 
-def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str], Optional[float]]:
-    """Return metascore, votes, duration_min, duration_text, genres, rating"""
+def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str], Optional[float], Optional[int]]:
+    """Return metascore, votes, duration_min, duration_text, genres, rating, year"""
     try:
         resp = session.get(url, timeout=8)
         if resp.status_code != 200:
-            return None, None, None, None, [], None
+            return None, None, None, None, [], None, None
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
 
@@ -370,25 +378,65 @@ def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optiona
                 rating = None
 
         genres: List[str] = []
+        year = None
         for s in soup.find_all("script", type="application/ld+json"):
             try:
                 j = json.loads(s.string)
-                g = j.get("genre")
-                if isinstance(g, list):
-                    genres.extend([x for x in g if isinstance(x, str)])
-                elif isinstance(g, str):
-                    genres.append(g)
+                objs = j if isinstance(j, list) else [j]
+                for obj in objs:
+                    if not isinstance(obj, dict):
+                        continue
+                    g = obj.get("genre")
+                    if isinstance(g, list):
+                        genres.extend([x for x in g if isinstance(x, str)])
+                    elif isinstance(g, str):
+                        genres.append(g)
+                    # Prefer structured year information in JSON-LD
+                    if year is None:
+                        dp = obj.get('datePublished') or obj.get('startDate') or obj.get('dateCreated')
+                        if dp:
+                            try:
+                                year = int(str(dp)[:4])
+                            except Exception:
+                                pass
+                    # Prefer duration from Movie / TVEpisode / TVSeries objects (avoid VideoObject trailers)
+                    if (dur_min is None) and ('@type' in obj or 'type' in obj):
+                        typ = obj.get('@type') or obj.get('type')
+                        if isinstance(typ, str):
+                            t = typ.lower()
+                            if any(x in t for x in ('movie', 'tvepisode', 'tvseries')):
+                                d = obj.get('duration') or obj.get('timeRequired')
+                                if d:
+                                    try:
+                                        # store raw JSON-LD duration (like 'PT2H22M') and parse
+                                        dur_text = d
+                                        dur_min = parse_duration_to_minutes(dur_text)
+                                    except Exception:
+                                        pass
             except Exception:
                 continue
         genres = list(dict.fromkeys([g for g in genres if g]))
+        # Fallback: simple regex for a 4-digit year anywhere on the page
+        if year is None:
+            m = re.search(r"\b(19|20)\d{2}\b", html)
+            if m:
+                try:
+                    year = int(m.group(0))
+                except Exception:
+                    year = None
 
-        return metascore, votes, dur_min, dur_text, genres, rating
+        # Sanity: if parsed duration is extremely large (e.g. total series runtime), ignore it
+        if dur_min is not None and dur_min > 10 * 60:
+            dur_min = None
+            dur_text = None
+
+        return metascore, votes, dur_min, dur_text, genres, rating, year
     except Exception:
-        return None, None, None, None, [], None
+        return None, None, None, None, [], None, None
 
 
 def fetch_details_with_retry(url: str, session: requests.Session, retries: int = 2, base_backoff: float = 0.4):
-    last = (None, None, None, None, [], None)
+    last = (None, None, None, None, [], None, None)
     for attempt in range(retries + 1):
         last = fetch_details_requests(url, session)
         if any(x is not None for x in last[:4]) or (last[4] and len(last[4]) > 0) or last[5] is not None:
@@ -498,7 +546,7 @@ def main(argv: Optional[List[str]] = None):
         done = 0
         total = len(futures)
         for f in concurrent.futures.as_completed(futures):
-            url, (metascore, votes, dur_min, dur_text, genres, rating) = f.result()
+            url, (metascore, votes, dur_min, dur_text, genres, rating, year) = f.result()
             r = url_to_record.get(url)
             if not r:
                 continue
@@ -513,6 +561,12 @@ def main(argv: Optional[List[str]] = None):
                 r["genres"] = genres
             if r.get("rating") is None and rating is not None:
                 r["rating"] = rating
+            # Fill year if we found it while fetching details
+            if (r.get("year") is None or r.get("year") is False) and year is not None:
+                try:
+                    r["year"] = int(year)
+                except Exception:
+                    r["year"] = year
 
             done += 1
             if done == 1 or done % 10 == 0 or done == total:

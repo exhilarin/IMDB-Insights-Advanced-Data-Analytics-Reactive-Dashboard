@@ -148,6 +148,14 @@ def parse_duration_to_minutes(duration_str: Optional[str]) -> Optional[int]:
     if not duration_str or not isinstance(duration_str, str):
         return None
     s = duration_str.strip().lower()
+    # support ISO 8601 durations appearing in JSON-LD like 'PT2H22M' or 'PT45M'
+    m_iso = re.search(r'pt\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', s, re.I)
+    if m_iso:
+        h = int(m_iso.group(1)) if m_iso.group(1) else 0
+        mm = int(m_iso.group(2)) if m_iso.group(2) else 0
+        # ignore seconds (group 3) for minute precision
+        if h or mm:
+            return h * 60 + mm
     # direct minutes like "150 min"
     m = re.search(r'(\d+)\s*min', s)
     if m:

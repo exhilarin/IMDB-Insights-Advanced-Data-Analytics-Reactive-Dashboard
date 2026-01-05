@@ -53,6 +53,15 @@ def parse_duration_to_minutes(s: Optional[str]) -> Optional[int]:
         return None
     text = str(s).strip().lower()
 
+    # Support ISO 8601 durations like 'PT2H22M' or 'PT45M'
+    m_iso = re.search(r'pt\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?', text, re.I)
+    if m_iso:
+        h = int(m_iso.group(1)) if m_iso.group(1) else 0
+        mm = int(m_iso.group(2)) if m_iso.group(2) else 0
+        # seconds (group 3) ignored when computing minutes
+        if h or mm:
+            return h * 60 + mm
+
     m = re.search(r"(\d+)\s*min", text)
     if m:
         return int(m.group(1))
@@ -179,11 +188,11 @@ def extract_top250_from_dom(driver: webdriver.Chrome) -> List[Dict]:
     return records
 
 
-def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str]]:
+def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str], Optional[int]]:
     try:
         resp = session.get(url, timeout=8)
         if resp.status_code != 200:
-            return None, None, None, None, []
+            return None, None, None, None, [], None
 
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
@@ -214,23 +223,63 @@ def fetch_details_requests(url: str, session: requests.Session) -> Tuple[Optiona
 
         # genres via JSON-LD first (usually stable)
         genres: List[str] = []
+        year = None
         for s in soup.find_all("script", type="application/ld+json"):
             try:
                 j = json.loads(s.string)
-                g = j.get("genre")
-                if isinstance(g, list):
-                    genres.extend([x for x in g if isinstance(x, str)])
-                elif isinstance(g, str):
-                    genres.append(g)
+                objs = j if isinstance(j, list) else [j]
+                for obj in objs:
+                    if not isinstance(obj, dict):
+                        continue
+                    g = obj.get("genre")
+                    if isinstance(g, list):
+                        genres.extend([x for x in g if isinstance(x, str)])
+                    elif isinstance(g, str):
+                        genres.append(g)
+                    # capture structured year if present
+                    if year is None:
+                        dp = obj.get('datePublished') or obj.get('startDate') or obj.get('dateCreated')
+                        if dp:
+                            try:
+                                year = int(str(dp)[:4])
+                            except Exception:
+                                pass
+                    # Prefer duration from Movie/TV objects; avoid VideoObject trailer durations
+                    if (duration_min is None) and ('@type' in obj or 'type' in obj):
+                        typ = obj.get('@type') or obj.get('type')
+                        if isinstance(typ, str):
+                            t = typ.lower()
+                            if any(x in t for x in ('movie', 'tvepisode', 'tvseries')):
+                                d = obj.get('duration') or obj.get('timeRequired')
+                                if d:
+                                    try:
+                                        duration_text = d
+                                        duration_min = parse_duration_to_minutes(duration_text)
+                                    except Exception:
+                                        pass
             except Exception:
                 continue
 
         # de-dup
         genres = list(dict.fromkeys([g for g in genres if g]))
 
-        return metascore, votes, duration_min, duration_text, genres
+        # fallback: regex year
+        if year is None:
+            m = re.search(r"\b(19|20)\d{2}\b", html)
+            if m:
+                try:
+                    year = int(m.group(0))
+                except Exception:
+                    year = None
+
+        # Sanity: ignore implausibly large parsed durations (likely total series runtime)
+        if duration_min is not None and duration_min > 10 * 60:
+            duration_min = None
+            duration_text = None
+
+        return metascore, votes, duration_min, duration_text, genres, year
     except Exception:
-        return None, None, None, None, []
+        return None, None, None, None, [], None
 
 
 def fetch_details_with_retry(
@@ -238,9 +287,9 @@ def fetch_details_with_retry(
     session: requests.Session,
     retries: int = 2,
     base_backoff: float = 0.4,
-) -> Tuple[str, Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str]]]:
+) -> Tuple[str, Tuple[Optional[int], Optional[int], Optional[int], Optional[str], List[str], Optional[int]]]:
     """Small retry wrapper so one slow/bad request doesn't kill overall speed."""
-    last = (None, None, None, None, [])
+    last = (None, None, None, None, [], None)
     for attempt in range(retries + 1):
         last = fetch_details_requests(url, session)
         # If we got something useful, stop early.
@@ -359,7 +408,7 @@ def main(argv: Optional[List[str]] = None):
         done = 0
         total = len(futures)
         for f in concurrent.futures.as_completed(futures):
-            url, (metascore, votes, dur_min, dur_text, genres) = f.result()
+            url, (metascore, votes, dur_min, dur_text, genres, year) = f.result()
             r = url_to_record.get(url)
             if not r:
                 continue
@@ -372,6 +421,12 @@ def main(argv: Optional[List[str]] = None):
                 r["duration"] = dur_text
             if genres and not r.get("genres"):
                 r["genres"] = genres
+            # attach discovered year if we didn't have it from the DOM
+            if (r.get("year") is None or r.get("year") is False) and year is not None:
+                try:
+                    r["year"] = int(year)
+                except Exception:
+                    r["year"] = year
 
             done += 1
             if done == 1 or done % 10 == 0 or done == total:
